@@ -2,17 +2,23 @@
   (:require [clojure.tools.logging :refer :all]
             [clojure.string :as str]
             [jepsen
+              [checker :as checker]
               [cli :as cli]
               [client :as client]
               [control :as c]
               [db :as db]
+              [nemesis :as nemesis]
               [generator :as gen]
               [tests :as tests]]
             [jepsen.control.util :as cu]
             [jepsen.os.ubuntu :as ubuntu]
+            [jepsen.checker.timeline :as timeline]
             [clojure.java.io :as io]
+            [knossos.model :as model]
             [zookeeper.data :as data]
-            [zookeeper :as zk]))
+            [slingshot.slingshot :refer [try+]]
+            [zookeeper :as zk])
+  (:import (org.apache.zookeeper ZooKeeper KeeperException KeeperException$BadVersionException)))
 
 (def dir     "/var/lib/clickhouse")
 (def binary "clickhouse")
@@ -116,10 +122,12 @@
         :read (assoc op :type :ok, :value (parse-zk-long (:data (zk/data conn "/"))))
         :write (do (zk/set-data conn "/" (data/to-bytes (str (:value op))) -1)
                    (assoc op :type :ok))
-        :cas (let [[old new] (:value op)]
-             (assoc op :type (if (zk-cas conn "/" old new)
-                               :ok
-                               :fail)))))
+        :cas (try
+              (let [[old new] (:value op)]
+                (assoc op :type (if (zk-cas conn "/" old new)
+                                  :ok
+                                  :fail)))
+              (catch KeeperException$BadVersionException _ (assoc op :type :fail, :error :bad-version)))))
 
   (teardown! [this test])
 
@@ -137,9 +145,18 @@
           :db (db "rbtorrent:c19fae30a6793344bf30d20521934be3774cfee7")
           :pure-generators true
           :client (Client. nil)
+          :nemesis (nemesis/partition-random-halves)
+          :checker (checker/compose
+                    {:perf   (checker/perf)
+                     :linear (checker/linearizable {:model     (model/cas-register)
+                                                    :algorithm :linear})
+                     :timeline (timeline/html)})
           :generator (->> (gen/mix [r w cas])
-                          (gen/stagger 1)
-                          (gen/nemesis nil)
+                          (gen/stagger 1/50)
+                          (gen/nemesis (cycle [(gen/sleep 5)
+                              {:type :info, :f :start}
+                              (gen/sleep 5)
+                              {:type :info, :f :stop}]))
                           (gen/time-limit 15))
           }))
 
